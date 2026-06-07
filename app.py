@@ -5,6 +5,9 @@ import networkx as nx
 import folium
 from streamlit_folium import st_folium
 import gzip
+import requests
+from datetime import datetime, timedelta
+import math
 
 # 1. 페이지 기본 설정
 st.set_page_config(page_title="서울 자전거 내비게이션", layout="wide")
@@ -34,6 +37,52 @@ def load_graph():
 
 G = load_graph()
 
+
+# --- [신규 추가 1] 실시간 풍향 가져오기 함수 ---
+def get_live_wind_direction():
+    auth_key = "GfxNFO0sTha8TRTtLM4WXw"
+    now = datetime.now() - timedelta(hours=1)
+    time_str = now.strftime('%Y%m%d%H00')
+    url = f"https://apihub.kma.go.kr/api/typ01/url/kma_sfctm2.php?tm={time_str}&stn=108&help=0&authKey={auth_key}"
+    try:
+        response = requests.get(url, timeout=3)
+        for line in response.text.split('\n'):
+            if not line.startswith('#') and ' 108 ' in line:
+                return int(line.split()[2]) * 10
+    except:
+        return None  # 통신 지연 등 오류 발생 시 None 반환
+    return None
+
+
+# --- [신규 추가 2] 도로 방향과 맞바람을 계산하여 동적 가중치 생성 ---
+def apply_dynamic_wind_weight(graph, wind_dir):
+    # 자전거는 양방향 통행이므로, 맞바람과 뒷바람을 정확히 구별하기 위해 그래프를 양방향(Directed)으로 쪼갭니다.
+    DG = graph.to_directed()
+
+    for u, v, data in DG.edges(data=True):
+        lon1, lat1 = u
+        lon2, lat2 = v
+
+        # 1. 도로의 진행 각도 계산 (위도/경도 기반 방위각)
+        dy = lat2 - lat1
+        dx = lon2 - lon1
+        road_angle = math.degrees(math.atan2(dx, dy))
+        if road_angle < 0:
+            road_angle += 360
+
+        # 2. 바람 방향과 내 주행 방향의 차이 계산 (0에 가까우면 맞바람, 180에 가까우면 뒷바람)
+        diff = abs(road_angle - wind_dir)
+        if diff > 180:
+            diff = 360 - diff
+
+        # 3. 페널티 부여: 맞바람(0도)일 때 기본 거리의 1.5배 페널티, 뒷바람(180도)일 땐 1.0배(기본) 적용
+        penalty = 1.0 + (1.0 - (diff / 180.0)) * 0.5
+
+        # 최단거리(weight_s6)를 기준으로 페널티를 곱해 실시간 코스트 생성
+        base_cost = data.get('weight_s6', 15)
+        data['live_wind_cost'] = base_cost * penalty
+
+    return DG
 # 3. 6가지 시나리오 맵핑
 scenarios = {
     "시나리오 1: 최저 피로도 경로": "weight_s1",
@@ -94,6 +143,7 @@ if st.session_state.end_coords:
     folium.Marker(st.session_state.end_coords, popup="도착지", icon=folium.Icon(color='red')).add_to(m)
 
 # 7. 알고리즘 길 찾기 실행 로직
+# (기존 코드의 if search_pressed: 안쪽 부분 교체)
 if search_pressed:
     if st.session_state.start_coords and st.session_state.end_coords:
         with st.spinner('선택하신 시나리오의 최적 경로를 계산 중입니다...'):
@@ -101,9 +151,23 @@ if search_pressed:
                 start_node = get_nearest_node(st.session_state.start_coords[0], st.session_state.start_coords[1], G)
                 end_node = get_nearest_node(st.session_state.end_coords[0], st.session_state.end_coords[1], G)
 
-                path = nx.shortest_path(G, source=start_node, target=end_node, weight=selected_weight)
+                # --- [수정된 부분] 4번 시나리오 선택 시 실시간 통신 분기 ---
+                # --- [수정된 부분] 6번 시나리오 선택 시 실시간 통신 분기 ---
+                # 주의: 아래 문자열이 현우님이 설정하신 6번 시나리오 이름과 띄어쓰기까지 완벽히 똑같아야 합니다.
+                if selected_scenario_name == "시나리오 6: 바람 방해 최소화 경로":
+                    wind_dir = get_live_wind_direction()
 
-                # 계산된 경로를 메모리(session_state)에 영구 저장!
+                    if wind_dir is not None:
+                        st.toast(f"🌀 기상청 실시간 풍향({wind_dir}도)을 다운로드하여 맞바람 저항을 계산합니다!", icon="🌬️")
+                        live_G = apply_dynamic_wind_weight(G, wind_dir)
+                        path = nx.shortest_path(live_G, source=start_node, target=end_node, weight='live_wind_cost')
+                    else:
+                        st.warning("현재 기상청 API 응답이 지연되어, 저장된 기본 바람 데이터를 사용합니다.")
+                        path = nx.shortest_path(G, source=start_node, target=end_node, weight=selected_weight)
+                else:
+                    # 다른 시나리오들은 원래대로 계산
+                    path = nx.shortest_path(G, source=start_node, target=end_node, weight=selected_weight)
+
                 st.session_state.path_coords = [(node[1], node[0]) for node in path]
 
             except nx.NetworkXNoPath:
@@ -112,7 +176,6 @@ if search_pressed:
                 st.error(f"경로 탐색 중 오류가 발생했습니다: {e}")
     else:
         st.warning("출발지와 도착지를 모두 지도에 클릭하여 지정해주셔야 합니다.")
-
 # =====================================================================
 # [핵심 수정 구간] 메모리에 경로가 있으면 무조건 지도에 그리기
 # =====================================================================
