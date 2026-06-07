@@ -8,7 +8,7 @@ import gzip
 
 # 1. 페이지 기본 설정
 st.set_page_config(page_title="서울 자전거 내비게이션", layout="wide")
-st.title("🚲 서울 자전거 맞춤형 내비게이션 (Prototype)")
+st.title("🚲 서울 자전거 맞춤형 내비게이션")
 
 
 # 2. 압축된 두뇌 파일 로드
